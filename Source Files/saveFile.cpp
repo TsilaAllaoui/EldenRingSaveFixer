@@ -1,292 +1,384 @@
+/*
+ * Copyright (c) 2022 Soar Qin<soarchin@gmail.com>
+ *
+ * Use of this source code is governed by an MIT-style
+ * license that can be found in the LICENSE file or at
+ * https://opensource.org/licenses/MIT.
+ */
+
 #include "savefile.h"
-#include <util.h>
+#include "mem.h"
 #include <fstream>
-#include <span>
-#include <string_view>
+#include <cstring>
 
-void Slot::copy(SaveSpan source, SaveSpan target, size_t targetSlotIndex) const {
-	const auto targetSlotSection{ ParseSlot(SlotSectionOffset, SlotSection.size, targetSlotIndex) };
-	const auto targetHeaderSection{ ParseHeader(SlotHeaderSectionOffset, SlotHeaderSection.size, targetSlotIndex) };
-	targetSlotSection.replace(target, SlotSection.bytesFrom(source));
-	targetHeaderSection.replace(target, SlotHeaderSection.bytesFrom(source));
+inline void readWString(std::wstring& output, const uint16_t* input) {
+    while (*input) {
+        output.push_back(*input++);
+    }
 }
 
-void Slot::debugListItems(SaveSpan data) {
-	const auto slot{ SlotSection.bytesFrom(data) };
-	std::vector<Items::ItemResult> recognized{};
-	std::vector<Items::ItemResult> unknown{};
-	Items::Items known;
-
-	for (auto itr{ slot.begin() }; itr + 2 != slot.end(); itr++) {
-		if (*itr == Items::ItemDelimiter.front() && *(itr + 1) == Items::ItemDelimiter.back()) [[unlikely]] {
-			const Items::ItemResult item{ static_cast<size_t>(itr - slot.begin()), {*(itr - 2), *(itr - 1)} };
-			const auto group{ known.hasGroup(item) };
-			const auto quantity{ getItemQuantity(data, item.item) };
-			if (!quantity) // Probably isnt an item
-				continue;
-
-			if (group.found && known.findId(item).empty()) // Ignore items we already know
-				recognized.emplace_back(item, group.name, quantity);
-			else
-				unknown.emplace_back(item, quantity);
-			}
-		else if (*(itr + 1) != Items::ItemDelimiter.front()) [[likely]]
-			itr++;
-	}
-
-	//// TODO: this sometimes doesnt find all duplicates, no idea why
-	//for (auto checking{ unknown.begin() }; checking != unknown.end(); checking++) {
-	//	for (auto pos{ checking }; pos + 1 != unknown.end(); pos++) {
-	//		auto duplicate{ std::find_if(pos, unknown.end(), [&checking](const Items::ItemResult& cmp) {
-	//			if (cmp.item.group == checking->item.group && cmp.item.id == checking->item.id && checking->quanity == cmp.quanity)
-	//				return true;
-	//			return false;
-	//		}) };
-
-	//		if (duplicate == unknown.end())
-	//			break;
-
-	//		checking->insertDuplicate(duplicate->offset);
-	//		unknown.erase(duplicate);
-	//	}
-	//}
-
-	if (!unknown.empty()) {
-		fmt::print("found {} unique unknown items:\n\n", unknown.size());
-		for (auto& result : unknown) {
-			if (!result.duplicates.empty())
-				fmt::print("\n");
-			fmt::print("0x{:06X}: group: {:02X}, id: {:02X}, quanity: {}\n", result.offset, result.item.group, result.item.id, result.quanity);
-			if (!result.duplicates.empty()) {
-				for (auto& dupe : result.duplicates)
-					fmt::print("    duplicate at 0x{:06X}\n", dupe);
-				fmt::print("\n");
-			}
-		}
-	}
-
-	if (!recognized.empty()) {
-		fmt::print("\nfound {} unknown items with a recognized group:\n\n", recognized.size());
-		for (auto& result : recognized)
-			fmt::print("0x{:06X}: {}, id: {:02X}, quanity: {}\n", result.offset, result.name, result.item.id, result.quanity);
-	}
+inline void findUserIDOffset(CharSlot* slot, const std::function<void(int offset)>& func) {
+    struct FindParam {
+        CharSlot* slot;
+        const std::function<void(int offset)>& func;
+    } param = { slot, func };
+    kmpSearch(slot->data.data() + 0x1E0000, slot->data.size() - 0x1E0000, "\x4D\x4F\x45\x47\x00\x26\x04\x21", 8, [](int offset, void* data) {
+        offset += 0x1E0000;
+        auto* slot = ((FindParam*)data)->slot;
+        offset += *(int*)&slot->data[offset - 4];
+        offset += 4;
+        if (memcmp(&slot->data[offset], "\x46\x4F\x45\x47\x00\x26\x04\x21", 8) != 0) return;
+        offset += *(int*)&slot->data[offset - 4];
+        offset += *(int*)&slot->data[offset] + 4 + 0x20078;
+        ((FindParam*)data)->func(offset);
+        }, &param);
 }
 
-void Slot::recalculateSlotChecksum(SaveSpan data) const {
-	auto hash{ util::GenerateMd5(SlotSection.bytesFrom(data)) };
-	SlotChecksumSection.replace(data, hash);
+inline size_t findLevelOffset(const std::vector<uint8_t>& data) {
+    const auto* ptr = data.data();
+    size_t sz = data.size() - 0x30;
+    for (size_t i = 0; i < sz; ++i) {
+        if (*(int*)(ptr + i) + *(int*)(ptr + i + 4) + *(int*)(ptr + i + 8) + *(int*)(ptr + i + 12) +
+            *(int*)(ptr + i + 16) + *(int*)(ptr + i + 20) + *(int*)(ptr + i + 24) + *(int*)(ptr + i + 28)
+            == 79 + *(int*)(ptr + i + 44)) {
+            return i + 44;
+        }
+    }
+    return 0;
 }
 
-void Slot::rename(SaveSpan data, std::string_view newName) const {
-	std::array<u8, NameSectionSize> convertedName{};
-	util::Utf8ToUtf16(convertedName, std::u16string(newName.begin(), newName.end()));
-	// Any characters sharing the same name will get replaced with the new name as of now
-	util::ReplaceAll<u8>(data, NameSection.bytesFrom(data), convertedName);
+SaveFile::SaveFile(const std::string& filename) {
+    std::ifstream fs(filename, std::ios::in | std::ios::binary);
+    ok_ = false;
+    if (!fs.is_open()) return;
+    uint32_t magic = 0;
+    fs.read((char*)&magic, sizeof(uint32_t));
+    if (magic == 0x34444E42) {
+        saveType_ = Steam;
+        ok_ = true;
+        fs.seekg(0, std::ios::beg);
+        header_.resize(0x300);
+        fs.read((char*)header_.data(), 0x300);
+        int slotCount = *(int*)&header_[12];
+        slots_.resize(slotCount);
+        for (int i = 0; i < slotCount; ++i) {
+            int slotSize = *(int*)&header_[0x48 + i * 0x20];
+            int slotOffset = *(int*)&header_[0x50 + i * 0x20];
+            int nameOffset = *(int*)&header_[0x54 + i * 0x20];
+            std::wstring slotFilename;
+            readWString(slotFilename, (const uint16_t*)&header_[nameOffset]);
+            std::unique_ptr<SaveSlot> slot;
+            if (slotSize == 0x280010) {
+                slot = std::make_unique<CharSlot>();
+                slot->slotType = SaveSlot::Character;
+            }
+            else if (slotSize == 0x60010) {
+                slot = std::make_unique<SummarySlot>();
+                slot->slotType = SaveSlot::Summary;
+            }
+            else {
+                slot = std::make_unique<SaveSlot>();
+                slot->slotType = SaveSlot::Other;
+            }
+            slot->offset = slotOffset;
+            slot->filename = slotFilename;
+            fs.seekg(slotOffset, std::ios::beg);
+            fs.read((char*)slot->md5hash, 16);
+            slotSize -= 16;
+            slot->data.resize(slotSize);
+            fs.read((char*)slot->data.data(), slotSize);
+            slots_[i] = std::move(slot);
+        }
+        fs.close();
+    }
+    else if (magic == 0x2C9C01CB) {
+        saveType_ = PS4;
+        ok_ = true;
+        fs.seekg(0, std::ios::beg);
+        header_.resize(0x70);
+        fs.read((char*)header_.data(), 0x70);
+        slots_.resize(12);
+        for (int i = 0; i < 12; ++i) {
+            std::unique_ptr<SaveSlot> slot;
+            int slotSize;
+            if (i < 10) {
+                slot = std::make_unique<CharSlot>();
+                slot->slotType = SaveSlot::Character;
+                slotSize = 0x280000;
+            }
+            else if (i < 11) {
+                slot = std::make_unique<SummarySlot>();
+                slot->slotType = SaveSlot::Summary;
+                slotSize = 0x60000;
+            }
+            else {
+                slot = std::make_unique<SaveSlot>();
+                slot->slotType = SaveSlot::Other;
+                slotSize = 0x240010;
+            }
+            slot->offset = static_cast<uint32_t>(fs.tellg());
+            slot->data.resize(slotSize);
+            fs.read((char*)slot->data.data(), slotSize);
+            slots_[i] = std::move(slot);
+        }
+        fs.close();
+    }
+    else {
+        fs.close();
+        return;
+    }
+    for (auto& slot : slots_) {
+        switch (slot->slotType) {
+        case SaveSlot::Character: {
+            auto* slot2 = (CharSlot*)slot.get();
+            slot2->useridOffset = 0;
+            slot2->userid = 0;
+            findUserIDOffset(slot2, [slot2](int offset) {
+                slot2->useridOffset = offset;
+                slot2->userid = *(uint64_t*)&slot2->data[offset];
+                });
+            auto offset = findLevelOffset(slot2->data);
+            if (offset >= 0x2C) {
+                slot2->level = *(uint16_t*)(slot2->data.data() + offset);
+                memcpy(slot2->stats, slot2->data.data() + offset - 0x2C, 8 * sizeof(uint32_t));
+            }
+            else {
+                slot2->level = 0;
+                memset(slot2->stats, 0, sizeof(slot2->stats));
+            }
+            break;
+        }
+        case SaveSlot::Summary: {
+            auto* slot2 = (SummarySlot*)slot.get();
+            slot2->userid = *(uint64_t*)&slot2->data[4];
+            for (size_t i = 0; i < slots_.size(); ++i) {
+                if (slots_[i]->slotType == SaveSlot::Character) {
+                    auto level = *(uint16_t*)&slot2->data[0x195E + 0x24C * i + 0x22];
+                    if (level == 0) continue;
+                    uint8_t available = *(uint8_t*)&slot2->data[0x1954 + i];
+                    auto* slot3 = (CharSlot*)slots_[i].get();
+                    readWString(slot3->charname, (const uint16_t*)&slot2->data[0x195E + 0x24C * i]);
+                    slot3->level = level;
+                    slot3->available = available;
+                }
+            }
+            break;
+        }
+        default:
+            break;
+        }
+    }
+    filename_ = filename;
 }
 
-u32 Slot::getItemQuantity(SaveSpan data, Items::Item item) const {
-	auto slot{ SlotSection.bytesFrom(data) };
-	const auto itr{ std::search(slot.begin(), slot.end(), item.data.begin(), item.data.end()) };
-	return (itr != slot.end()) ? slot[itr - slot.begin() + item.data.size()] : 0;
+bool SaveFile::exportToFile(const std::string& filename, int slot) {
+    if (slot < 0 || slot >= slots_.size() || slots_[slot]->slotType != SaveSlot::Character) { return false; }
+    std::ofstream ofs(filename, std::ios::out | std::ios::binary);
+    if (!ofs.is_open()) { return false; }
+    const auto& data = slots_[slot]->data;
+    ofs.write((const char*)data.data(), data.size());
+    ofs.close();
+    return true;
 }
 
-void Slot::setItemQuantity(SaveSpan data, Items::Item item, u32 quantity) const {
-	constexpr static auto itemSize{ 10 };
-	auto slot{ SlotSection.bytesFrom(data) };
-	size_t quantityOffset{};
+bool SaveFile::importFromFile(const std::string& filename, int slot) {
+    if (slot < 0 || slot >= slots_.size() || slots_[slot]->slotType != SaveSlot::Character) { return false; }
+    std::ifstream ifs(filename, std::ios::in | std::ios::binary);
+    if (!ifs.is_open()) { return false; }
+    ifs.seekg(0, std::ios::end);
+    auto& data = slots_[slot]->data;
+    if (ifs.tellg() != data.size()) { ifs.close(); return false; }
+    ifs.seekg(0, std::ios::beg);
+    ifs.read((char*)data.data(), data.size());
+    ifs.close();
 
-	if (auto itr = std::search(slot.begin(), slot.end(), item.data.begin(), item.data.end()); itr != slot.end())
-		// If the item is already present we can just update the quantity
-		quantityOffset = (itr - slot.begin()) + item.data.size();
-	else {
-		// Otherwise we need to insert it. This currently works, but only for a few items.
-		for (size_t i{}; i < slot.size(); i++) {
-			// Check if an item exists at the current position
-			if (slot[i] == Items::ItemDelimiter.front() && slot[i + 1] == Items::ItemDelimiter.back()) {
-				const auto nextItem{ i + itemSize };
-				const auto nextItemEnd{ i + (itemSize * 2) };
-				// Check if the space after the found item is empty
-				if (std::search_n(slot.begin() + nextItem, slot.begin() + nextItemEnd, itemSize, 0x0) != slot.begin() + nextItemEnd) {
-					// If yes, copy the requested item into it
-					std::copy(item.data.begin(), item.data.end(), slot.begin() + nextItem);
-					quantityOffset = nextItem + item.data.size();
-					break;
-				}
-				else
-					i += itemSize;
-			}
-		}
-	}
+    auto* slot2 = (CharSlot*)slots_[slot].get();
+    slot2->useridOffset = 0;
+    slot2->userid = 0;
+    findUserIDOffset(slot2, [slot2](int offset) {
+        slot2->useridOffset = offset;
+        slot2->userid = *(uint64_t*)&slot2->data[offset];
+        });
 
-	if (!quantityOffset)
-		throw exception("Could not find a place for item with quantity {}", quantity);
-	slot[quantityOffset] = static_cast<u8>(quantity);
+    std::fstream fs(filename_, std::ios::in | std::ios::out | std::ios::binary);
+
+    auto offset = findLevelOffset(data);
+    if (offset >= 0x2C) {
+        slot2->level = *(uint16_t*)(slot2->data.data() + offset);
+        memcpy(slot2->stats, slot2->data.data() + offset - 0x2C, 8 * sizeof(uint32_t));
+    }
+    else {
+        slot2->level = 0;
+        memset(slot2->stats, 0, sizeof(slot2->stats));
+    }
+    if (offset >= 0) {
+        for (auto& s : slots_) {
+            if (s->slotType == SaveSlot::Summary) {
+                /* use global userid */
+                slot2->userid = ((SummarySlot*)s.get())->userid;
+                *(uint64_t*)&slot2->data[slot2->useridOffset] = slot2->userid;
+                /* copy level and name to summary */
+                *(uint16_t*)&s->data[0x195E + 0x24C * slot + 0x22] = slot2->level;
+                memcpy(&s->data[0x195E + 0x24C * slot], &data[offset + 0x34], 0x22);
+                md5Hash(s->data.data(), s->data.size(), s->md5hash);
+                fs.seekg(s->offset, std::ios::beg);
+                if (saveType_ == Steam)
+                    fs.write((const char*)s->md5hash, 16);
+                fs.write((const char*)s->data.data(), s->data.size());
+                break;
+            }
+        }
+    }
+    fs.seekg(slot2->offset, std::ios::beg);
+    md5Hash(data.data(), data.size(), slot2->md5hash);
+    if (saveType_ == Steam)
+        fs.write((const char*)slot2->md5hash, 16);
+    fs.write((const char*)data.data(), data.size());
+    fs.close();
+    return true;
 }
 
-std::string Slot::getName(SaveSpan data) const {
-	return util::Utf16ToUtf8String(NameSection.bytesFrom(data));
+bool SaveFile::exportFaceToFile(const std::string& filename, int slot) {
+    if (slot < 0 || slot >= slots_.size() || slots_[slot]->slotType != SaveSlot::Character) { return false; }
+    std::ofstream ofs(filename, std::ios::out | std::ios::binary);
+    if (!ofs.is_open()) { return false; }
+    const auto& data = slots_[slot]->data;
+    struct SearchData {
+        std::ofstream& ofs;
+        const std::vector<uint8_t>& data;
+    };
+    SearchData sd = { ofs, data };
+    kmpSearch(data.data(), data.size(), "\x46\x41\x43\x45\x04\x00\x00\x00\x20\x01\x00\x00", 12, [](int offset, void* data) {
+        auto& sd = *reinterpret_cast<SearchData*>(data);
+        sd.ofs.write((const char*)sd.data.data() + offset, 0x120);
+        }, &sd);
+    ofs.close();
+    return true;
 }
 
-void Slot::setActive(SaveSpan data, bool value) const {
-	ActiveSection.bytesFrom(data)[index] = value;
+bool SaveFile::importFaceFromFile(const std::string& filename, int slot) {
+    if (slot < 0 || slot >= slots_.size() || slots_[slot]->slotType != SaveSlot::Character) { return false; }
+    std::ifstream ifs(filename, std::ios::in | std::ios::binary);
+    if (!ifs.is_open()) { return false; }
+    ifs.seekg(0, std::ios::end);
+    uint8_t face[0x120];
+    if (ifs.tellg() != 0x120) { ifs.close(); return false; }
+    ifs.seekg(0, std::ios::beg);
+    ifs.read((char*)face, 0x120);
+    ifs.close();
+    if (memcmp(face, "\x46\x41\x43\x45\x04\x00\x00\x00\x20\x01\x00\x00", 12) != 0) { return false; }
+
+    auto* slot2 = (CharSlot*)slots_[slot].get();
+    auto& data = slot2->data;
+    struct SearchData {
+        uint8_t* face;
+        std::vector<uint8_t>& data;
+    };
+    SearchData sd = { face, data };
+    kmpSearch(data.data(), data.size(), "\x46\x41\x43\x45\x04\x00\x00\x00\x20\x01\x00\x00", 12, [](int offset, void* data) {
+        auto& sd = *reinterpret_cast<SearchData*>(data);
+        memcpy(sd.data.data() + offset, sd.face, 0x120);
+        }, &sd);
+
+    std::fstream fs(filename_, std::ios::in | std::ios::out | std::ios::binary);
+
+    for (auto& s : slots_) {
+        if (s->slotType == SaveSlot::Summary) {
+            memcpy(&s->data[0x195E + 0x24C * slot + 0x3A], face, 0x120);
+            md5Hash(s->data.data(), s->data.size(), s->md5hash);
+            fs.seekg(s->offset, std::ios::beg);
+            if (saveType_ == Steam)
+                fs.write((const char*)s->md5hash, 16);
+            fs.write((const char*)s->data.data(), s->data.size());
+            break;
+        }
+    }
+    fs.seekg(slot2->offset, std::ios::beg);
+    md5Hash(data.data(), data.size(), slot2->md5hash);
+    if (saveType_ == Steam)
+        fs.write((const char*)slot2->md5hash, 16);
+    fs.write((const char*)data.data(), data.size());
+    fs.close();
+    return true;
 }
 
-std::string Slot::getTimePlayed(SaveSpan data) const {
-	return util::SecondsToTimeStamp(SecondsPlayedSection.castInteger<u32>(data));
+void SaveFile::listSlots(int slot, const std::function<void(int, const SaveSlot&)>& func) {
+    fprintf(stdout, "SaveType: %s\n", saveType_ == Steam ? "Steam" : "PS4");
+    if (saveType_ == Steam) {
+        for (auto& s : slots_) {
+            if (s->slotType == SaveSlot::Summary) {
+                fprintf(stdout, "User ID:  %llu\n", ((SummarySlot*)s.get())->userid);
+                break;
+            }
+        }
+    }
+    if (slot < 0) {
+        for (int i = 0; i < slots_.size(); ++i) {
+            listSlot(i);
+        }
+    }
+    else if (slot < slots_.size()) {
+        listSlot(slot);
+    }
 }
 
-u64 Slot::getLevel(SaveSpan data) const {
-	return LevelSection.castInteger<u8>(data);
+std::vector<std::unique_ptr<SaveSlot>> SaveFile::getCharactersSlots()
+{
+    std::vector<std::unique_ptr<SaveSlot>> charactersSlots;
+    if (saveType_ != Steam) {
+        std::cout << "Only Steam save file supported for now..." << std::endl;
+        return {};
+    }
+
+    for (auto i = 0; i < slots_.size(); i++) {
+        if (slots_[i]->slotType == SaveSlot::Character) {
+            charactersSlots.emplace_back(std::move(slots_[i]));
+        }
+    }
+    return charactersSlots;
 }
 
-bool Slot::isActive(SaveSpan data, size_t slotIndex) const {
-	return static_cast<bool>(ActiveSection.bytesFrom(data)[slotIndex]);
+void SaveFile::listSlot(int slot) {
+    auto& s = slots_[slot];
+    switch (s->slotType) {
+    case SaveSlot::Character: {
+        auto* slot2 = (CharSlot*)s.get();
+        if (slot2->charname.empty()) break;
+        fprintf(stdout, "%4d: %ls (Level %d)\n", slot, slot2->charname.c_str(), slot2->level);
+        break;
+    }
+    case SaveSlot::Summary:
+        fprintf(stdout, "%4d: Summary\n", slot);
+        break;
+    default:
+        fprintf(stdout, "%4d: Other\n", slot);
+        break;
+    }
 }
 
-void SaveFile::validateData(SaveSpan data, std::string_view target) const {
-	if (HeaderBNDSection.stringFrom(data) != "BND" || data.size_bytes() != SaveFileSize)
-		throw exception("{} is not a valid Elden Ring save file.", target);
+void SaveFile::fixHashes() {
+    if (saveType_ != Steam) { return; }
+    std::fstream fs(filename_, std::ios::in | std::ios::out | std::ios::binary);
+    uint8_t hash[16];
+    for (auto& slot : slots_) {
+        md5Hash(slot->data.data(), slot->data.size(), hash);
+        if (memcmp(hash, slot->md5hash, 16) != 0) {
+            memcpy(slot->md5hash, hash, 16);
+            fs.seekg(slot->offset, std::ios::beg);
+            fs.write((const char*)hash, 16);
+        }
+    }
+    fs.close();
 }
 
-u64 SaveFile::steamId() const {
-	return SteamIdSection.castInteger<u64>(saveData);
-}
-
-void SaveFile::debugListItems(int slotIndex) {
-	slots[slotIndex].debugListItems(saveData);
-}
-
-std::vector<u8> SaveFile::loadFile(std::filesystem::path path) const {
-	std::ifstream file(path, std::ios::in | std::ios::binary);
-	std::vector<u8> buffer;
-	if (!std::filesystem::exists(path))
-		throw exception("Path {} does not exist.", util::ToAbsolutePath(path).generic_string());
-	if (!file.is_open())
-		throw exception("Could not open file '{}'", util::ToAbsolutePath(path).generic_string());
-
-	uint8_t byte;
-	while (file.read(reinterpret_cast<char*>(&byte), sizeof(uint8_t))) {
-		buffer.push_back(byte);
-	}
-
-	file.close();
-	return buffer;
-}
-
-void SaveFile::write(SaveSpan data, std::filesystem::path path) const {
-	// TODO: Seems like this messes up slot names sometimes? Probably encoding related
-	std::ofstream file(path, std::ios::out | std::ios::binary);
-	if (!std::filesystem::exists(path))
-		throw exception("Path {} does not exist.", util::ToAbsolutePath(path).generic_string());
-	if (!file.is_open())
-		throw exception("Could not open file '{}'", util::ToAbsolutePath(path).generic_string());
-
-	validateData(data, "Generated data");
-	recalculateChecksums(data);
-	file.write(reinterpret_cast<const char*>(data.data()), data.size_bytes());
-}
-
-const std::vector<Slot> SaveFile::parseSlots(SaveSpan data) const {
-	std::vector<Slot> buffer;
-	for (size_t i{}; i < SlotCount; i++)
-		buffer.push_back(Slot{ data, i });
-
-	return buffer;
-}
-
-void SaveFile::refreshSlots() {
-	auto newSlots{ parseSlots(saveData) };
-	slots.swap(newSlots);
-}
-
-void SaveFile::copySlot(SaveFile& source, size_t sourceSlotIndex, size_t targetSlotIndex) {
-	if (targetSlotIndex > SlotCount || sourceSlotIndex > SlotCount)
-		throw exception("Invalid slot index while copying character");
-
-	source.slots[sourceSlotIndex].copy(source.saveData, saveData, targetSlotIndex);
-	replaceSteamId(source.saveData, steamId());
-	setSlotActivity(targetSlotIndex, true);
-	refreshSlots();
-}
-
-void SaveFile::copySlot(size_t sourceSlotIndex, size_t targetSlotIndex) {
-	return copySlot(*this, sourceSlotIndex, targetSlotIndex);
-}
-
-void SaveFile::appendSlot(SaveFile& source, size_t sourceSlotIndex) {
-	size_t firstAvailableSlot{ SlotCount + 1 };
-	for (auto& slot : slots)
-		if (!slot.active) {
-			firstAvailableSlot = slot.index;
-			break;
-		}
-
-	if (firstAvailableSlot == SlotCount + 1)
-		throw exception("Could not find an unactive slot to append slot {} to", sourceSlotIndex);
-	copySlot(source, sourceSlotIndex, firstAvailableSlot);
-	setSlotActivity(firstAvailableSlot, true);
-}
-
-void SaveFile::appendSlot(size_t sourceSlotIndex) {
-	return appendSlot(*this, sourceSlotIndex);
-}
-
-void SaveFile::renameSlot(size_t slotIndex, std::string_view name) {
-	if (slotIndex > SlotCount)
-		throw exception("Invalid slot index while renaming character");
-
-	slots[slotIndex].rename(saveData, name);
-	refreshSlots();
-}
-
-void SaveFile::replaceSteamId(SaveSpan replaceFrom, u64 newSteamId) const {
-	std::array<u8, sizeof(u64)> steamIdData{};
-	std::memcpy(steamIdData.data(), &newSteamId, sizeof(u64));
-	util::ReplaceAll<u8>(saveData, SteamIdSection.bytesFrom(replaceFrom), steamIdData);
-}
-
-void SaveFile::replaceSteamId(u64 newSteamId) const {
-	replaceSteamId(saveData, newSteamId);
-}
-
-void SaveFile::recalculateChecksums(SaveSpan data) const {
-	auto saveHeaderChecksum{ util::GenerateMd5(SaveHeaderSection.bytesFrom(data)) };
-	SaveHeaderChecksumSection.replace(data, saveHeaderChecksum);
-	for (auto& slot : slots)
-		slot.recalculateSlotChecksum(data);
-}
-
-void SaveFile::setSlotActivity(size_t slotIndex, bool active) {
-	slots[slotIndex].setActive(saveData, active);
-	refreshSlots();
-}
-
-u32 SaveFile::getItem(size_t slot, Items::Item item) const {
-	return slots[slot].getItemQuantity(saveData, item);
-}
-
-void SaveFile::setItem(size_t slot, Items::Item item, u32 quantity) const {
-	slots[slot].setItemQuantity(saveData, item, quantity);
-}
-
-void SaveFile::printActiveSlots() const {
-	for (auto slot : slots)
-		if (slot.active)
-			printSlot(slot.index);
-}
-
-void SaveFile::printSlot(size_t slotIndex) const {
-	const auto slot{ slots[slotIndex] };
-	if (!slot.active)
-		fmt::print("warning: slot {} is not active\n", slotIndex);
-	fmt::print("slot {}: {}, level {}, played for {}\n", slotIndex, slot.name, slot.level, slot.timePlayed);
-}
-
-void SaveFile::printItems(size_t slotIndex) const {
-	const auto slot{ slots[slotIndex] };
-	if (!slot.active)
-		fmt::print("warning: slot {} is not active\n", slotIndex);
-	for (auto item : items)
-		if (getItem(slotIndex, item.second))
-			fmt::print("{}: {}\n", item.first, getItem(slotIndex, item.second));
+bool SaveFile::verifyHashes() {
+    if (saveType_ != Steam) { return true; }
+    uint8_t hash[16];
+    for (auto& slot : slots_) {
+        md5Hash(slot->data.data(), slot->data.size(), hash);
+        if (memcmp(hash, slot->md5hash, 16) != 0) {
+            return false;
+        }
+    }
+    return true;
 }
