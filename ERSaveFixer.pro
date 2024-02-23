@@ -5,7 +5,7 @@
 QT += widgets
 
 TEMPLATE = app
-TARGET = ERSaveEditor
+TARGET = ERSaveFixer
 INCLUDEPATH += .
 
 # The following define makes your compiler warn you if you use any
