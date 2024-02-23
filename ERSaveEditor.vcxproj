@@ -91,6 +91,7 @@
       <TreatWChar_tAsBuiltInType>true</TreatWChar_tAsBuiltInType>
       <WarningLevel>Level3</WarningLevel>
       <MultiProcessorCompilation>true</MultiProcessorCompilation>
+      <LanguageStandard>stdcpp17</LanguageStandard>
     </ClCompile>
     <Link>
       <AdditionalDependencies>shell32.lib;%(AdditionalDependencies)</AdditionalDependencies>
@@ -132,6 +133,7 @@
       <TreatWChar_tAsBuiltInType>true</TreatWChar_tAsBuiltInType>
       <WarningLevel>Level3</WarningLevel>
       <MultiProcessorCompilation>true</MultiProcessorCompilation>
+      <LanguageStandard>stdcpp17</LanguageStandard>
     </ClCompile>
     <Link>
       <AdditionalDependencies>shell32.lib;%(AdditionalDependencies)</AdditionalDependencies>
@@ -190,6 +192,12 @@
   </ItemGroup>
   <ItemGroup>
     <QtUic Include="erSaveFixer.ui" />
+  </ItemGroup>
+  <ItemGroup>
+    <Image Include="Resource Files\icon.jpg" />
+  </ItemGroup>
+  <ItemGroup>
+    <QtRcc Include="Resource Files\resources.qrc" />
   </ItemGroup>
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />
   <Import Project="$(QtMsBuild)\qt.targets" Condition="Exists('$(QtMsBuild)\qt.targets')" />

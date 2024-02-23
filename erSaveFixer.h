@@ -10,7 +10,7 @@ class ERSaveFixer : public QMainWindow
 
 public:
     ERSaveFixer(QWidget* parent = nullptr);
-    ~ERSaveFixer();
+    ~ERSaveFixer() = default;
 
 private:
     Ui::ERSaveFixerClass ui;

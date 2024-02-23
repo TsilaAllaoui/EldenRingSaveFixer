@@ -1,5 +1,8 @@
 #include <QFileDialog>
 #include <QMessageBox>
+#include <filesystem>
+#include <Windows.h>
+#include <ShlObj.h>
 #include "erSaveFixer.h"
 
 ERSaveFixer::ERSaveFixer(QWidget* parent)
@@ -10,13 +13,37 @@ ERSaveFixer::ERSaveFixer(QWidget* parent)
     ui.fixButton->setHidden(true);
 }
 
-ERSaveFixer::~ERSaveFixer()
-{}
-
 void ERSaveFixer::onChooseFile() {
+
+    // Getting Elden Ring folder in Roaming
+    std::wstring roamingPathW;
+    wchar_t path[MAX_PATH];
+    if (SUCCEEDED(SHGetFolderPath(NULL, CSIDL_APPDATA, NULL, 0, path))) {
+        roamingPathW = std::wstring(path);
+    }
+
+    std::string roamingPath(roamingPathW.begin(), roamingPathW.end());
+    roamingPath += "\\EldenRing\\";
+    if (std::filesystem::exists(roamingPath)) {
+        std::string steamIdFolder = "";
+        for (auto& entry : std::filesystem::directory_iterator(roamingPath)) {
+            if (std::filesystem::is_directory(entry)) {
+                steamIdFolder = entry.path().string();
+                break;
+            }
+        }
+        if (!steamIdFolder.empty()) {
+            roamingPath = steamIdFolder;
+        }
+        else {
+            roamingPath = "";
+        }
+    }
+
+
     QString filePath = QFileDialog::getOpenFileName(nullptr,
         "Open File",
-        "",
+        QString(roamingPath.c_str()),
         "All Files (*.sl2)");
     if (!filePath.isEmpty()) {
         ui.saveFileLineEdit->setText(filePath);

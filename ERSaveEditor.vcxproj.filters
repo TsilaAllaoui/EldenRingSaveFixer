@@ -25,6 +25,9 @@
       <UniqueIdentifier>{4FC737F1-C7A5-4376-A066-2A32D752A2FF}</UniqueIdentifier>
       <Extensions>cpp;c;cxx;def;odl;idl;hpj;bat;asm;asmx</Extensions>
     </Filter>
+    <Filter Include="Resource Files">
+      <UniqueIdentifier>{35138e62-a08b-49e9-81b0-f81d9dff6749}</UniqueIdentifier>
+    </Filter>
   </ItemGroup>
   <ItemGroup>
     <ClCompile Include="Source Files\main.cpp">
@@ -39,36 +42,27 @@
     <ClCompile Include="Source Files\mem.cpp">
       <Filter>Source Files</Filter>
     </ClCompile>
+    <ClCompile Include="erSaveFixer.cpp">
+      <Filter>Generated Files</Filter>
+    </ClCompile>
+    <ClCompile Include="Source Files\savefile.cpp">
+      <Filter>Generated Files</Filter>
+    </ClCompile>
   </ItemGroup>
   <ItemGroup>
     <ClInclude Include="Header Files\md5.h">
       <Filter>Header Files</Filter>
     </ClInclude>
-    <ClInclude Include="\Header Files\md5.h">
-      <Filter>Header Files</Filter>
-    </ClInclude>
     <ClInclude Include="Header Files\md5_simd.h">
-      <Filter>Header Files</Filter>
-    </ClInclude>
-    <ClInclude Include="\Header Files\md5_simd.h">
       <Filter>Header Files</Filter>
     </ClInclude>
     <ClInclude Include="Header Files\mem.h">
       <Filter>Header Files</Filter>
     </ClInclude>
-    <ClInclude Include="\Header Files\mem.h">
-      <Filter>Header Files</Filter>
-    </ClInclude>
     <ClInclude Include="Header Files\savefile.h">
       <Filter>Header Files</Filter>
     </ClInclude>
-    <ClInclude Include="\Header Files\savefile.h">
-      <Filter>Header Files</Filter>
-    </ClInclude>
     <ClInclude Include="Header Files\version.h">
-      <Filter>Header Files</Filter>
-    </ClInclude>
-    <ClInclude Include="\Header Files\version.h">
       <Filter>Header Files</Filter>
     </ClInclude>
   </ItemGroup>
@@ -79,5 +73,23 @@
     <CustomBuild Include="release\moc_predefs.h.cbt">
       <Filter>Generated Files</Filter>
     </CustomBuild>
+  </ItemGroup>
+  <ItemGroup>
+    <QtMoc Include="erSaveFixer.h">
+      <Filter>Generated Files</Filter>
+    </QtMoc>
+  </ItemGroup>
+  <ItemGroup>
+    <QtUic Include="erSaveFixer.ui" />
+  </ItemGroup>
+  <ItemGroup>
+    <QtRcc Include="Resource Files\resources.qrc">
+      <Filter>Resource Files</Filter>
+    </QtRcc>
+  </ItemGroup>
+  <ItemGroup>
+    <Image Include="Resource Files\icon.jpg">
+      <Filter>Resource Files</Filter>
+    </Image>
   </ItemGroup>
 </Project>
