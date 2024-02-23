@@ -5,6 +5,11 @@
 - Choose SL2 save
 - Fix if save valid
 
+### Screenshots
+![alt text](Images/invalid.png)
+![alt text](Images/fixing.png)
+![alt text](Images/valid.png)
+
 ### Building 🛠️
 - You will need Visual Studio 2017 or higher and just open the .sln file
 
